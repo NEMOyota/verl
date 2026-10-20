@@ -25,6 +25,7 @@ import torch
 from omegaconf import DictConfig, open_dict
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
+from verl.experimental.agent_loop.compact_output import CompactAgentLoopOutput
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
     prepare_single_generation_data,
@@ -314,7 +315,8 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         """
         worker = self._select_best_worker()
         output_future = worker.generate_sequences.remote(prompts)
-        return await asyncio.wrap_future(output_future.future())
+        output = await asyncio.wrap_future(output_future.future())
+        return output.unpack(prompts) if isinstance(output, CompactAgentLoopOutput) else output
 
     def _select_best_worker(self):
         """Select the best worker, simple round-robin load balancing"""

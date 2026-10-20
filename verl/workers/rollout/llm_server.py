@@ -118,6 +118,8 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
+        if kwargs.get("prompt_embeds") is not None and self.config.actor_rollout_ref.rollout.name != "vllm":
+            raise ValueError("Precomputed prompt_embeds requires the vllm rollout backend")
         server_id, server = await self._acquire_server(
             request_id,
             prompt_ids=prompt_ids,
@@ -249,6 +251,11 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         Returns:
             TokenOutput: token output
         """
+        if kwargs.get("prompt_embeds") is not None:
+            raise ValueError(
+                "prompt_embeds does not support fully asynchronous partial-rollout resume; "
+                "use LLMServerClient so the prompt embeddings remain aligned with prompt_ids"
+            )
         prompt_ids = normalize_token_ids(prompt_ids)
 
         limit_key = None

@@ -246,8 +246,7 @@ class ServerAdapter(BaseRollout):
         # reset caches after updating weights
         if self._has_server:
             await self.server_handle.clear_kv_cache.remote()
-            if global_steps is not None:
-                await self.server_handle.set_global_steps.remote(global_steps)
+            await self.server_handle.set_global_steps.remote(global_steps)
 
         if self.replica_rank == 0 and self.rollout_rank == 0:
             logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
@@ -272,7 +271,7 @@ class ServerAdapter(BaseRollout):
             # A steady sync with no changed BF16 values sends only a terminal
             # marker: weights are unchanged, so advance the step tag without
             # touching the transfer engine or the KV cache.
-            if global_steps is not None and self._ensure_server_handle():
+            if self._ensure_server_handle():
                 await self.server_handle.set_global_steps.remote(global_steps)
             return
 
@@ -315,8 +314,7 @@ class ServerAdapter(BaseRollout):
 
         if self._has_server:
             await self.server_handle.clear_kv_cache.remote()
-            if global_steps is not None:
-                await self.server_handle.set_global_steps.remote(global_steps)
+            await self.server_handle.set_global_steps.remote(global_steps)
 
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix matching the rollout type (e.g. 'vllm_')."""

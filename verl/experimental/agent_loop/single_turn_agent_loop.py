@@ -64,6 +64,9 @@ class SingleTurnAgentLoop(AgentLoopBase):
         mm_processor_output = self.build_sglang_video_payload(videos, mm_inputs)
 
         # 3. generate sequences
+        embedding_kwargs = {}
+        if kwargs.get("prompt_embeds") is not None:
+            embedding_kwargs["prompt_embeds"] = kwargs["prompt_embeds"]
         metrics = {}
         with simple_timer("generate_sequences", metrics):
             request_id = f"det-{priority}" if getattr(self.rollout_config, "full_determinism", False) else uuid4().hex
@@ -77,6 +80,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 mm_processor_output=mm_processor_output,
                 mm_processor_kwargs=mm_processor_kwargs,
                 priority=priority,
+                **embedding_kwargs,
             )
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1

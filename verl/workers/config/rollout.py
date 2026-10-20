@@ -72,6 +72,8 @@ class CustomAsyncServerConfig(BaseConfig):
 @dataclass
 class AgentLoopConfig(BaseConfig):
     num_workers: int = 8
+    # Strip padding and duplicate input_ids on the worker -> manager RPC.
+    compact_output: bool = False
     default_agent_loop: str = "single_turn_agent"
     agent_loop_config_path: Optional[str] = None
     custom_async_server: CustomAsyncServerConfig = field(default_factory=CustomAsyncServerConfig)
@@ -140,6 +142,11 @@ class CheckpointEngineConfig(BaseConfig):
     # backend is instantiated, allowing custom backends to register themselves
     # in CheckpointEngineRegistry.
     custom_backend_module: Optional[str] = None
+    # Receive unmerged LoRA adapters into CPU memory before pausing vLLM.
+    # Requires identical, preloaded frozen base weights at both sites.
+    lora_staging: bool = False
+    # Per rollout checkpoint worker; excludes the transport's existing buckets.
+    lora_staging_max_megabytes: int = 4096
 
 
 @dataclass

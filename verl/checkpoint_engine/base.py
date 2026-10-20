@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
@@ -321,6 +322,12 @@ class CheckpointEngineWorker(Worker):
         super().__init__()
         self.rollout_config = rollout_config
         self.model_config = model_config
+        if rollout_config.checkpoint_engine.lora_staging:
+            if rollout_config.name != "vllm" or "dummy" in rollout_config.load_format:
+                raise ValueError("LoRA staging requires vLLM with a preloaded frozen base (load_format != dummy)")
+            if model_config.lora.get("merge", False):
+                raise ValueError("LoRA staging requires unmerged adapters")
+        self._staged_lora = None
 
         self.server_adapter: BaseRollout = server_adapter
         backend = self.rollout_config.checkpoint_engine.backend
@@ -358,6 +365,55 @@ class CheckpointEngineWorker(Worker):
             global_steps=global_steps,
             wire_format=getattr(self.checkpoint_engine, "wire_format", "named_tensors"),
         )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def stage_lora_weights(self, peft_config: dict, global_steps: int = None):
+        """Copy the complete adapter out of reused transport buckets before commit."""
+        if self._staged_lora is not None:
+            raise RuntimeError("A staged LoRA update is already pending")
+        config = self.rollout_config.checkpoint_engine
+        byte_limit = config.lora_staging_max_megabytes << 20
+        bucket_bytes = config.update_weights_bucket_megabytes << 20
+        weights = []
+        total_bytes = 0
+        oversized_tensor = None
+        async for name, tensor in ensure_async_iterator(
+            self.checkpoint_engine.receive_weights(global_steps=global_steps)
+        ):
+            total_bytes += tensor.nbytes
+            if tensor.nbytes > bucket_bytes:
+                oversized_tensor = name
+            if total_bytes <= byte_limit and oversized_tensor is None:
+                # Blocking copy: the receive iterator may immediately reuse its
+                # device bucket. CPU tensors need copy=True for the same reason.
+                weights.append((name, tensor.detach().to(device="cpu", copy=True)))
+            else:
+                weights.clear()
+                # Drain the transfer before reporting failure, so senders can
+                # finish and the manager can safely finalize their buffers.
+        if total_bytes > byte_limit:
+            raise ValueError(f"LoRA staging needs {total_bytes} bytes, exceeding its {byte_limit}-byte limit")
+        if oversized_tensor is not None:
+            raise ValueError(f"LoRA tensor {oversized_tensor} exceeds the local IPC bucket; increase bucket size")
+        self._staged_lora = (global_steps, peft_config, weights)
+        return total_bytes
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def commit_staged_lora(self, global_steps: int = None):
+        if self._staged_lora is None or self._staged_lora[0] != global_steps:
+            raise ValueError("No complete LoRA adapter staged for the requested policy version")
+        _, peft_config, weights = self._staged_lora
+        await self.server_adapter.update_weights(
+            iter(weights),
+            global_steps=global_steps,
+            peft_config=peft_config,
+            base_sync_done=True,
+        )
+        self._staged_lora = None
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def discard_staged_lora(self):
+        self._staged_lora = None
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
@@ -418,6 +474,11 @@ class CheckpointEngineManager:
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.actor_wg = actor_wg
         self.replicas = replicas
+        if config.lora_staging:
+            if config.backend == "naive" or self.backend_cls.wire_format != "named_tensors":
+                raise ValueError("LoRA staging requires a disaggregated named-tensor checkpoint engine")
+            if config.lora_staging_max_megabytes <= 0:
+                raise ValueError("lora_staging_max_megabytes must be positive")
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for actor worker group and rollout replicas."""
@@ -519,15 +580,18 @@ class CheckpointEngineManager:
             ray.get(self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend))
             return {}
 
-        # 1. abort and save all unfinished requests for partial rollout
-        await self.abort_replicas()
-
-        # 2. create a temporay worker group for all replicas
+        # Create a temporary worker group for all replicas.
         workers = []
         for replica in self.replicas:
             workers.extend(replica.workers)
         rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
         actor_wg = self.actor_wg
+
+        if self.config.lora_staging:
+            return await self._update_staged_lora_weights(rollout, global_steps)
+
+        # 1. abort and save all unfinished requests for partial rollout
+        await self.abort_replicas()
 
         # 3. release kv_cache before weight sync (weights stay in place)
         await self.release_kv_cache_replicas()
@@ -560,6 +624,57 @@ class CheckpointEngineManager:
         await self.resume_generation_replicas()
 
         return sync_metrics
+
+    async def _update_staged_lora_weights(self, rollout: RayWorkerGroup, global_steps: int | None):
+        """Keep WAN transfer outside the generation pause; commit one complete version."""
+        started = time.monotonic()
+        peft_configs = ray.get(self.actor_wg.prepare_lora_sync(global_steps=global_steps))
+        peft_config = peft_configs[0]
+        if any(config != peft_config for config in peft_configs[1:]):
+            raise ValueError("Trainer ranks disagree on the LoRA configuration")
+
+        # These buckets coexist with the active policy and KV cache. Their
+        # device memory must be budgeted in addition to the CPU staging limit.
+        self.build_process_group(rollout)
+        refs = self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend, adapter_only=True)
+        refs += rollout.stage_lora_weights(peft_config=peft_config, global_steps=global_steps)
+        # Wait for every rank, even on failure, before reclaiming transport memory.
+        results = await asyncio.gather(*refs, return_exceptions=True)
+        try:
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+        except BaseException:
+            ray.get(rollout.discard_staged_lora())
+            raise
+        finally:
+            ray.get(
+                self.actor_wg.execute_checkpoint_engine(["finalize"] * self.actor_wg.world_size)
+                + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
+            )
+
+        metrics = {}
+        for result in results[: self.actor_wg.world_size]:
+            if isinstance(result, dict):
+                metrics.update(result)
+        metrics["checkpoint/lora_stage_seconds"] = time.monotonic() - started
+        metrics["checkpoint/lora_staged_bytes_per_worker"] = max(results[self.actor_wg.world_size :], default=0)
+
+        # The existing admission gate remains closed until all ranks have
+        # installed the new adapter and reset their caches. If commit fails,
+        # do not resume a partially updated replica.
+        pause_started = time.monotonic()
+        await self.abort_replicas()
+        await self.release_kv_cache_replicas()
+        commits = await asyncio.gather(*rollout.commit_staged_lora(global_steps=global_steps), return_exceptions=True)
+        ray.get(rollout.discard_staged_lora())
+        for result in commits:
+            if isinstance(result, BaseException):
+                raise result
+        await self.resume_kv_cache_replicas()
+        await self.resume_generation_replicas()
+        metrics["checkpoint/lora_pause_seconds"] = time.monotonic() - pause_started
+        return metrics
 
 
 async def split_weight_chunks(

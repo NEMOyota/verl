@@ -128,6 +128,8 @@ verl is fast with:
 
    advance/one_step_off
    advance/delta_weight_sync
+   advance/lora_staging
+   advance/cross_site_rollout
    advance/v1_async_trainer
    advance/fully_async
    advance/async-on-policy-distill

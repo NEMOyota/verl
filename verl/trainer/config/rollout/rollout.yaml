@@ -257,6 +257,10 @@ agent:
   # Number of agent loop workers
   num_workers: 8
 
+  # Return ragged tensors and reuse unchanged raw prompts across worker -> manager RPC.
+  # The manager restores the standard padded DataProto before training.
+  compact_output: false
+
   # default agent loop to use if `agent_name` not set in RL dataset
   default_agent_loop: single_turn_agent
 
@@ -314,6 +318,14 @@ checkpoint_engine:
   # backend is instantiated, allowing custom backends to register themselves
   # in CheckpointEngineRegistry.
   custom_backend_module: null
+
+  # Stage adapter-only updates on CPU while the old policy continues generating.
+  # Requires vLLM, unmerged LoRA, and the same preloaded base (load_format != dummy).
+  lora_staging: false
+
+  # Maximum staged adapter bytes per checkpoint worker, in MiB.
+  # Transport buckets and the active adapter consume additional memory.
+  lora_staging_max_megabytes: 4096
 
 # trace rollout data
 trace:

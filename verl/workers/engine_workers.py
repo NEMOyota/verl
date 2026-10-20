@@ -777,7 +777,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    async def update_weights(self, global_steps: int = None, mode: str = "auto"):
+    def prepare_lora_sync(self, global_steps: int = None):
+        """Prepare an adapter-only export without publishing a new rollout version."""
+        if not self.config.rollout.checkpoint_engine.lora_staging:
+            raise ValueError("prepare_lora_sync requires checkpoint_engine.lora_staging")
+        if self.config.model.lora.get("merge", False):
+            raise ValueError("LoRA staging requires unmerged adapters")
+        if "dummy" in self.config.rollout.load_format:
+            raise ValueError("LoRA staging requires the same pretrained base loaded on trainer and rollout")
+        weights, peft_config = self.actor.engine.get_per_tensor_param(
+            layered_summon=self.config.rollout.get("layered_summon", False),
+            base_sync_done=True,
+        )
+        if peft_config is None:
+            raise ValueError("LoRA staging requires an engine with adapter-only weight export")
+        self._pending_lora_export = (global_steps, weights)
+        return peft_config
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def update_weights(self, global_steps: int = None, mode: str = "auto", adapter_only: bool = False):
         """Update weights from trainer to rollout.
 
         1. For sync training with colocated trainer and rollout, update rollout directly from model engine.
@@ -813,7 +831,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 # snapshot prime), so it drives the training engine itself.
                 metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
             else:
-                per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+                if adapter_only:
+                    export_step, per_tensor_param = self._pending_lora_export
+                    if export_step != global_steps:
+                        raise ValueError("Prepared LoRA export does not match the requested policy version")
+                    del self._pending_lora_export
+                else:
+                    per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
                 metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
             if self.actor.engine.is_param_offload_enabled:
                 self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)

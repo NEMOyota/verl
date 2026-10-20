@@ -25,6 +25,7 @@ from pprint import pprint
 from typing import Any, Callable, Optional
 
 import ray
+import torch
 import vllm.entrypoints.cli.serve
 from packaging import version
 from ray.actor import ActorHandle
@@ -33,7 +34,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.cli.serve import run_headless
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
 from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
-from vllm.inputs import TokensPrompt
+from vllm.inputs import EmbedsPrompt, TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
@@ -179,6 +180,7 @@ class vLLMHttpServer:
         self.nnodes = nnodes
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
+        self._weight_update_epoch = 0
         self._warned_missing_spec_decode_stats = False
 
         # vLLM's pause stops requests being scheduled but still accepts them, and a request
@@ -581,13 +583,24 @@ class vLLMHttpServer:
         priority: int = 0,
         kv_transfer_params: Optional[dict] = None,
         session_id: Optional[str] = None,
+        prompt_embeds: Optional[torch.Tensor] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out.
 
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
             session_id: Sticky caller id; turns of one session go to the same DP engine.
+            prompt_embeds: Precomputed text embeddings, aligned with prompt_ids.
         """
+        if prompt_embeds is not None:
+            if self._disaggregation_role != "null":
+                raise ValueError("prompt_embeds currently requires rollout.disaggregation.enabled=False")
+            if not self.config.engine_kwargs.get("vllm", {}).get("enable_prompt_embeds", False):
+                raise ValueError("Set rollout.engine_kwargs.vllm.enable_prompt_embeds=True to send prompt_embeds")
+            if prompt_embeds.ndim != 2 or prompt_embeds.shape[0] != len(prompt_ids):
+                raise ValueError("prompt_embeds must have shape [len(prompt_ids), hidden_size]")
+            if image_data is not None or video_data is not None or audio_data is not None:
+                raise ValueError("Precomputed prompt_embeds currently supports text-only requests")
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
                 prompt_ids,
@@ -663,6 +676,13 @@ class vLLMHttpServer:
 
         self._preprocess_sampling_params(sampling_params)
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        if prompt_embeds is not None and (
+            sampling_params.repetition_penalty != 1.0 or sampling_params.prompt_logprobs is not None
+        ):
+            raise ValueError(
+                "EmbedsPrompt requires repetition_penalty=1 and prompt_logprobs=None; "
+                "the engine does not receive the original prompt token history"
+            )
         validate_topk_logprob_request(sampling_params)
         budget_warnings = getattr(self, "_topk_budget_warnings", set())
         warn_topk_logprob_budget(sampling_params, budget_warnings)
@@ -679,42 +699,44 @@ class vLLMHttpServer:
         prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
         if mm_processor_kwargs:
             prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
-        try:
-            prompt = TokensPrompt(**prompt_kwargs)
-        except TypeError:
-            prompt = prompt_kwargs
-
-        # Add lora request
-        lora_request = None
-        if self.lora_as_adapter:
-            # Make sure we also check that the lora is already loaded in the engine
-            lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
-            if lora_loaded:
-                lora_request = LoRARequest(
-                    lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
-                )
+        if prompt_embeds is not None:
+            prompt = EmbedsPrompt(prompt_embeds=prompt_embeds)
+        else:
+            try:
+                prompt = TokensPrompt(**prompt_kwargs)
+            except TypeError:
+                prompt = prompt_kwargs
 
         rejected = await self._park_until_admitted(request_id)
         if rejected is not None:
             return rejected
 
+        # Capture the version only after admission: a parked request may outlive a
+        # weight update. External KV stores use the resulting request.block_hashes.
+        request_global_steps = self.global_steps
+        policy_version = f"step:{request_global_steps}:update:{self._weight_update_epoch}"
+        prompt["cache_salt"] = f"verl:{policy_version}"
+        admitted = False
         with RLInsightLogger.trace_state(
             "vllm_generate",
             state_lane_id=ray.get_runtime_context().get_actor_name(),
         ):
-            generator = self.engine.generate(
-                prompt=prompt,
-                sampling_params=sampling_params,
-                request_id=request_id,
-                lora_request=lora_request,
-                priority=priority,
-                data_parallel_rank=self._dp_rank_for_session(session_id),
-            )
-
             # Get final response
             final_res: Optional[RequestOutput] = None
-            admitted = False
             try:
+                lora_request = None
+                if self.lora_as_adapter and VLLM_LORA_INT_ID in await self.engine.list_loras():
+                    lora_request = LoRARequest(
+                        lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
+                    )
+                generator = self.engine.generate(
+                    prompt=prompt,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                    lora_request=lora_request,
+                    priority=priority,
+                    data_parallel_rank=self._dp_rank_for_session(session_id),
+                )
                 async for output in generator:
                     if not admitted:
                         admitted = True
@@ -725,7 +747,7 @@ class vLLMHttpServer:
                     self._admitting -= 1
             assert final_res is not None
 
-        extra_fields = {"global_steps": self.global_steps}
+        extra_fields = {"global_steps": request_global_steps, "policy_version": policy_version}
         # Handle abort case: when the request is aborted by pause_generation(abort),
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".
@@ -1081,9 +1103,10 @@ class vLLMHttpServer:
                 self.profiler_keep_global_ranks,
             )
 
-    async def set_global_steps(self, global_steps: int):
+    async def set_global_steps(self, global_steps: Optional[int]):
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
+        self._weight_update_epoch += 1
 
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()

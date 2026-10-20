@@ -343,6 +343,7 @@ actor_rollout_ref:
     agent:
       _target_: verl.workers.config.AgentLoopConfig
       num_workers: 8
+      compact_output: false
       default_agent_loop: single_turn_agent
       agent_loop_config_path: null
       custom_async_server:
@@ -355,6 +356,8 @@ actor_rollout_ref:
       update_weights_bucket_megabytes: 2048
       engine_kwargs: {}
       custom_backend_module: null
+      lora_staging: false
+      lora_staging_max_megabytes: 4096
     trace:
       _target_: verl.workers.config.TraceConfig
       project_name: ${oc.select:trainer.project_name,null}

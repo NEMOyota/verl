@@ -1,7 +1,7 @@
 Agent Loop
 ==========
 
-Last updated: 07/17/2025.
+Last updated: 10/20/2026.
 
 .. versionadded:: 0.4.2
    [status: alpha]
@@ -229,6 +229,40 @@ they can call ``LLMServerClient.generate`` to generate response_ids.
                List[int]: List of generated token ids.
            """
            ...
+
+Compact worker output
+~~~~~~~~~~~~~~~~~~~~~
+
+When agent loop workers and the manager are separated by a constrained link, enable:
+
+.. code:: yaml
+
+   actor_rollout_ref:
+     rollout:
+       agent:
+         compact_output: true
+
+Workers then return tensors with padding removed. The manager restores the original
+padded ``DataProto`` before concatenation, reward processing, and training. Generated
+tokens, tool masks, behavior log probabilities, rewards, position IDs, and existing
+policy/group metadata retain their values and dtypes. ``input_ids`` is reconstructed
+from the returned prompt and response tokens instead of transmitting those tokens
+twice. Unchanged ``raw_prompt`` entries are restored from the manager's input batch;
+prompts modified by an agent are still returned.
+Inherited ``prompt_embeds`` arrays are also restored from the manager's local input
+instead of sending these large tensors back. Embeddings are read-only agent inputs:
+custom agents must return a new object if they need to change them; replacement
+objects are transmitted normally.
+
+This option defaults to false. It reduces the worker-to-manager payload at the cost
+of CPU packing and unpacking. It does not change worker placement, input transport,
+reward placement, or the inference server's per-token protocol. Custom tensor fields
+are preserved without compression, and tensors with nonuniform padding retain their
+dense representation. This is batch transport; it does not introduce streaming or
+retry deduplication.
+The standard manager and ``FullyAsyncAgentLoopManager`` both restore compact
+results. The V1 TransferQueue worker overrides the batch-return path and already
+writes unpadded records directly to its queue; this option does not alter that path.
 
 Next
 ----

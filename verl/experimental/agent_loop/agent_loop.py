@@ -45,6 +45,7 @@ from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
+from verl.experimental.agent_loop.compact_output import CompactAgentLoopOutput, snapshot_raw_prompts
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
 from verl.trainer.distillation import is_distillation_enabled
@@ -594,7 +595,7 @@ class AgentLoopWorker:
                 mm_processor_kwargs["sampling_rate"] = int(sampling_rate)
         return mm_processor_kwargs
 
-    async def generate_sequences(self, batch: DataProto) -> DataProto:
+    async def generate_sequences(self, batch: DataProto) -> DataProto | CompactAgentLoopOutput:
         """Generate sequences from agent loop.
 
         Args:
@@ -616,6 +617,7 @@ class AgentLoopWorker:
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
         config = self.rollout_config
+        raw_prompt_snapshot = snapshot_raw_prompts(batch) if config.agent.compact_output else None
         validate = batch.meta_info.get("validate", False)
         sampling_params = dict(
             temperature=config.temperature,
@@ -687,6 +689,8 @@ class AgentLoopWorker:
         output = self._postprocess(
             outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
         )
+        if config.agent.compact_output:
+            return CompactAgentLoopOutput.pack(output, raw_prompt_snapshot, batch.non_tensor_batch)
         return output
 
     async def _run_agent_loop(
@@ -1282,6 +1286,10 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        outputs = [
+            output.unpack(chunk) if isinstance(output, CompactAgentLoopOutput) else output
+            for output, chunk in zip(outputs, chunkes, strict=True)
+        ]
         output = DataProto.concat(outputs)
 
         # calculate performance metrics

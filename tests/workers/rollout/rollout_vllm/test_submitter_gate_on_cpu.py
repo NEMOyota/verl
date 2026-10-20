@@ -84,6 +84,7 @@ def _make_server(node_rank: int = 0, cls=vllm_async_server.vLLMHttpServer):
     server = object.__new__(cls)
     server.node_rank = node_rank
     server.global_steps = 7
+    server._weight_update_epoch = 0
     server.engine = _FakeEngine()
     server.engine.server = server
     server._submission_paused = False
